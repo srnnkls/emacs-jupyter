@@ -215,6 +215,15 @@ If there is no name associated, return nil.  See
   (let ((kernel-names (assoc (oref server url) jupyter-server-kernel-names)))
     (cdr (assoc id kernel-names))))
 
+(defun jupyter-server-kernel-notebook (server id)
+  "Return the notebook associated with kernel ID on SERVER."
+  (cl-check-type server jupyter-server)
+  (let* ((kernels (mapcar (lambda (x) (append (plist-get x :kernel)
+                                         (list :notebook (plist-get x :name))))
+                          (jupyter-api-get-sessions server)))
+         (kernel (seq-filter (lambda (x) (string= (plist-get x :id) id)) kernels)))
+    (plist-get (car kernel) :notebook)))
+
 (defun jupyter-server-kernel-id-from-name (server name)
   "Return the ID of the kernel that has NAME on SERVER.
 If NAME does not have a kernel associated, return nil.  See
@@ -531,7 +540,8 @@ least the following keys:
             (mapcar (lambda (k)
                  (cl-destructuring-bind
                      (&key name id last_activity &allow-other-keys) k
-                   (concat name " (last activity: " last_activity ", id: " id ")")))
+                   (let ((notebook (jupyter-server-kernel-notebook server id)))
+                     (concat notebook " (kernel: " name ", last activity: " last_activity ", id: " id ")"))))
                kernels)))
          (name (completing-read "kernel: " display-names nil t)))
     (when (equal name "")
@@ -623,6 +633,183 @@ is used as determined by `jupyter-current-server'."
   (let* ((specs (jupyter-server-kernelspecs server))
          (spec (jupyter-completing-read-kernelspec specs)))
     (jupyter-api-start-kernel server (car spec))))
+
+;;; `jupyter-server-kernel-list'
+
+(defun jupyter-server-kernel-list-do-shutdown ()
+  "Shutdown the kernel corresponding to the current entry."
+  (interactive)
+  (when-let* ((id (tabulated-list-get-id))
+              (really (yes-or-no-p
+                       (format "Really shutdown %s kernel? "
+                               (aref (tabulated-list-get-entry) 0)))))
+    (let ((manager (jupyter-server-find-manager jupyter-current-server id)))
+      (if manager (jupyter-shutdown-kernel manager)
+        (jupyter-api-shutdown-kernel jupyter-current-server id)))
+    (tabulated-list-delete-entry)))
+
+(defun jupyter-server-kernel-list-do-restart ()
+  "Restart the kernel corresponding to the current entry."
+  (interactive)
+  (when-let* ((id (tabulated-list-get-id))
+              (really (yes-or-no-p "Really restart kernel? ")))
+    (let ((manager (jupyter-server-find-manager jupyter-current-server id)))
+      (if manager (jupyter-shutdown-kernel manager 'restart)
+        (jupyter-api-restart-kernel jupyter-current-server id)))
+    (revert-buffer)))
+
+(defun jupyter-server-kernel-list-do-interrupt ()
+  "Interrupt the kernel corresponding to the current entry."
+  (interactive)
+  (when-let* ((id (tabulated-list-get-id)))
+    (jupyter-api-interrupt-kernel jupyter-current-server id)
+    (revert-buffer)))
+
+(defun jupyter-server-kernel-list-new-repl ()
+  "Connect a REPL to the kernel corresponding to the current entry."
+  (interactive)
+  (when-let* ((id (tabulated-list-get-id)))
+    (let ((jupyter-current-client
+           (jupyter-connect-server-repl jupyter-current-server id)))
+      (revert-buffer)
+      (jupyter-repl-pop-to-buffer))))
+
+(defun jupyter-server-kernel-list-launch-kernel ()
+  "Launch a new kernel on the server."
+  (interactive)
+  (jupyter-server-launch-kernel jupyter-current-server)
+  (revert-buffer))
+
+(defun jupyter-server-kernel-list-name-kernel ()
+  "Name the kernel under `point'."
+  (interactive)
+  (when-let* ((id (tabulated-list-get-id))
+              (name (read-string
+                     (let ((cname (jupyter-server-kernel-name
+                                   jupyter-current-server id)))
+                       (if cname (format "Rename %s to: " cname)
+                         (format "Name kernel [%s]: " id))))))
+    (when (zerop (length name))
+      (jupyter-server-kernel-list-name-kernel))
+    (jupyter-server-name-kernel jupyter-current-server id name)
+    (revert-buffer)))
+
+(defvar jupyter-server-kernel-list-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-i") #'jupyter-server-kernel-list-do-interrupt)
+    (define-key map (kbd "d") #'jupyter-server-kernel-list-do-shutdown)
+    (define-key map (kbd "C-c C-d") #'jupyter-server-kernel-list-do-shutdown)
+    (define-key map (kbd "C-c C-r") #'jupyter-server-kernel-list-do-restart)
+    (define-key map [follow-link] nil) ;; allows mouse-1 to be activated
+    (define-key map [mouse-1] #'jupyter-server-kernel-list-new-repl)
+    (define-key map (kbd "RET") #'jupyter-server-kernel-list-new-repl)
+    (define-key map (kbd "C-RET") #'jupyter-server-kernel-list-launch-kernel)
+    (define-key map (kbd "C-<return>") #'jupyter-server-kernel-list-launch-kernel)
+    (define-key map (kbd "<return>") #'jupyter-server-kernel-list-new-repl)
+    (define-key map "R" #'jupyter-server-kernel-list-name-kernel)
+    (define-key map "r" #'revert-buffer)
+    (define-key map "g" #'revert-buffer)
+    map))
+
+(define-derived-mode jupyter-server-kernel-list-mode
+  tabulated-list-mode "Jupyter Server Kernels"
+  "A list of live kernels on a Jupyter kernel server."
+  (tabulated-list-init-header)
+  (tabulated-list-print)
+  (let ((inhibit-read-only t)
+        (url (oref jupyter-current-server url)))
+    (overlay-put
+     (make-overlay 1 2)
+     'before-string
+     (concat (propertize url 'face '(fixed-pitch default)) "\n")))
+  ;; So that `dired-jump' will visit the directory of the kernel server.
+  (setq default-directory
+        (jupyter-tramp-file-name-from-url
+         (oref jupyter-current-server url))))
+
+(defun jupyter-server--kernel-list-format ()
+  (let* ((get-time
+          (lambda (a)
+            (or (get-text-property 0 'jupyter-time a)
+                (let ((time (jupyter-decode-time a)))
+                  (prog1 time
+                    (put-text-property 0 1 'jupyter-time time a))))))
+         (time-sort
+          (lambda (a b)
+            (time-less-p
+             (funcall get-time (aref (nth 1 a) 3))
+             (funcall get-time (aref (nth 1 b) 3)))))
+         (conn-sort
+          (lambda (a b)
+            (< (string-to-number (aref (nth 1 a) 5))
+               (string-to-number (aref (nth 1 b) 5))))))
+    `[("Name" 17 t)
+      ("Notebook" 25 t)
+      ("ID" 38 nil)
+      ("Activity" 20 ,time-sort)
+      ("State" 10 nil)
+      ("Conns." 6 ,conn-sort)]))
+
+(defun jupyter-server--kernel-list-entries ()
+  (cl-loop
+   with names = nil
+   for kernel across (jupyter-api-get-kernel jupyter-current-server)
+   collect
+   (cl-destructuring-bind
+       (&key name id last_activity execution_state
+             connections &allow-other-keys)
+       kernel
+     (let* ((time (jupyter-decode-time last_activity))
+            (name (propertize
+                   (or (jupyter-server-kernel-name jupyter-current-server id)
+                       (let ((same (cl-remove-if-not
+                                    (lambda (x) (string-prefix-p name x)) names)))
+                         (when same (setq name (format "%s<%d>" name (length same))))
+                         (push name names)
+                         name))
+                   'face 'font-lock-constant-face))
+            (notebook (propertize
+                       (jupyter-server-kernel-notebook jupyter-current-server id)
+                   'face 'font-lock-constant-face))
+            (activity (propertize (jupyter-format-time-low-res time)
+                                  'face 'font-lock-doc-face
+                                  'jupyter-time time))
+            (conns (propertize (number-to-string connections)
+                               'face 'shadow))
+            (state (propertize execution_state
+                               'face (pcase execution_state
+                                       ("busy" 'warning)
+                                       ("idle" 'shadow)
+                                       ("starting" 'success)))))
+       (list id (vector name notebook id activity state conns))))))
+
+;;;###autoload
+(defun jupyter-server-list-kernels (server)
+  "Display a list of live kernels on SERVER.
+When called interactively, ask to select a SERVER when given a
+prefix argument otherwise the `jupyter-current-server' will be
+used."
+  (interactive (list (jupyter-current-server current-prefix-arg)))
+  (if (zerop (length (jupyter-api-get-kernel server)))
+      (when (yes-or-no-p (format "No kernels at %s; launch one? "
+                                 (oref server url)))
+        (jupyter-server-launch-kernel server)
+        (jupyter-server-list-kernels server))
+    (with-current-buffer
+        (jupyter-get-buffer-create (format "kernels[%s]" (oref server url)))
+      (setq jupyter-current-server server)
+      (if (eq major-mode 'jupyter-server-kernel-list-mode)
+          (revert-buffer)
+        (setq tabulated-list-format (jupyter-server--kernel-list-format)
+              tabulated-list-entries #'jupyter-server--kernel-list-entries
+              tabulated-list-sort-key (cons "Activity" t))
+        (jupyter-server-kernel-list-mode)
+        ;; So that `dired-jump' will visit the directory of the kernel server.
+        (setq default-directory
+              (jupyter-tramp-file-name-from-url (oref server url))))
+      (jupyter-display-current-buffer-reuse-window))))
+
+(provide 'jupyter-server)
 
 ;;; REPL
 
@@ -728,179 +915,9 @@ the same meaning as in `jupyter-connect-repl'."
                           :spec (assoc (plist-get model :name) specs))))))
          (client (jupyter-make-client manager client-class)))
     (jupyter-start-channels client)
-    (jupyter-bootstrap-repl client repl-name associate-buffer display)))
-
-;;; `jupyter-server-kernel-list'
-
-(defun jupyter-server-kernel-list-do-shutdown ()
-  "Shutdown the kernel corresponding to the current entry."
-  (interactive)
-  (when-let* ((id (tabulated-list-get-id))
-              (really (yes-or-no-p
-                       (format "Really shutdown %s kernel? "
-                               (aref (tabulated-list-get-entry) 0)))))
-    (let ((manager (jupyter-server-find-manager jupyter-current-server id)))
-      (if manager (jupyter-shutdown-kernel manager)
-        (jupyter-api-shutdown-kernel jupyter-current-server id)))
-    (tabulated-list-delete-entry)))
-
-(defun jupyter-server-kernel-list-do-restart ()
-  "Restart the kernel corresponding to the current entry."
-  (interactive)
-  (when-let* ((id (tabulated-list-get-id))
-              (really (yes-or-no-p "Really restart kernel? ")))
-    (let ((manager (jupyter-server-find-manager jupyter-current-server id)))
-      (if manager (jupyter-shutdown-kernel manager 'restart)
-        (jupyter-api-restart-kernel jupyter-current-server id)))
-    (revert-buffer)))
-
-(defun jupyter-server-kernel-list-do-interrupt ()
-  "Interrupt the kernel corresponding to the current entry."
-  (interactive)
-  (when-let* ((id (tabulated-list-get-id)))
-    (jupyter-api-interrupt-kernel jupyter-current-server id)
-    (revert-buffer)))
-
-(defun jupyter-server-kernel-list-new-repl ()
-  "Connect a REPL to the kernel corresponding to the current entry."
-  (interactive)
-  (when-let* ((id (tabulated-list-get-id)))
-    (let ((jupyter-current-client
-           (jupyter-connect-server-repl jupyter-current-server id)))
-      (revert-buffer)
-      (jupyter-repl-pop-to-buffer))))
-
-(defun jupyter-server-kernel-list-launch-kernel ()
-  "Launch a new kernel on the server."
-  (interactive)
-  (jupyter-server-launch-kernel jupyter-current-server)
-  (revert-buffer))
-
-(defun jupyter-server-kernel-list-name-kernel ()
-  "Name the kernel under `point'."
-  (interactive)
-  (when-let* ((id (tabulated-list-get-id))
-              (name (read-string
-                     (let ((cname (jupyter-server-kernel-name
-                                   jupyter-current-server id)))
-                       (if cname (format "Rename %s to: " cname)
-                         (format "Name kernel [%s]: " id))))))
-    (when (zerop (length name))
-      (jupyter-server-kernel-list-name-kernel))
-    (jupyter-server-name-kernel jupyter-current-server id name)
-    (revert-buffer)))
-
-(defvar jupyter-server-kernel-list-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "C-c C-i") #'jupyter-server-kernel-list-do-interrupt)
-    (define-key map (kbd "d") #'jupyter-server-kernel-list-do-shutdown)
-    (define-key map (kbd "C-c C-d") #'jupyter-server-kernel-list-do-shutdown)
-    (define-key map (kbd "C-c C-r") #'jupyter-server-kernel-list-do-restart)
-    (define-key map [follow-link] nil) ;; allows mouse-1 to be activated
-    (define-key map [mouse-1] #'jupyter-server-kernel-list-new-repl)
-    (define-key map (kbd "RET") #'jupyter-server-kernel-list-new-repl)
-    (define-key map (kbd "C-RET") #'jupyter-server-kernel-list-launch-kernel)
-    (define-key map (kbd "C-<return>") #'jupyter-server-kernel-list-launch-kernel)
-    (define-key map (kbd "<return>") #'jupyter-server-kernel-list-new-repl)
-    (define-key map "R" #'jupyter-server-kernel-list-name-kernel)
-    (define-key map "r" #'revert-buffer)
-    (define-key map "g" #'revert-buffer)
-    map))
-
-(define-derived-mode jupyter-server-kernel-list-mode
-  tabulated-list-mode "Jupyter Server Kernels"
-  "A list of live kernels on a Jupyter kernel server."
-  (tabulated-list-init-header)
-  (tabulated-list-print)
-  (let ((inhibit-read-only t)
-        (url (oref jupyter-current-server url)))
-    (overlay-put
-     (make-overlay 1 2)
-     'before-string
-     (concat (propertize url 'face '(fixed-pitch default)) "\n")))
-  ;; So that `dired-jump' will visit the directory of the kernel server.
-  (setq default-directory
-        (jupyter-tramp-file-name-from-url
-         (oref jupyter-current-server url))))
-
-(defun jupyter-server--kernel-list-format ()
-  (let* ((get-time
-          (lambda (a)
-            (or (get-text-property 0 'jupyter-time a)
-                (let ((time (jupyter-decode-time a)))
-                  (prog1 time
-                    (put-text-property 0 1 'jupyter-time time a))))))
-         (time-sort
-          (lambda (a b)
-            (time-less-p
-             (funcall get-time (aref (nth 1 a) 2))
-             (funcall get-time (aref (nth 1 b) 2)))))
-         (conn-sort
-          (lambda (a b)
-            (< (string-to-number (aref (nth 1 a) 4))
-               (string-to-number (aref (nth 1 b) 4))))))
-    `[("Name" 17 t)
-      ("ID" 38 nil)
-      ("Activity" 20 ,time-sort)
-      ("State" 10 nil)
-      ("Conns." 6 ,conn-sort)]))
-
-(defun jupyter-server--kernel-list-entries ()
-  (cl-loop
-   with names = nil
-   for kernel across (jupyter-api-get-kernel jupyter-current-server)
-   collect
-   (cl-destructuring-bind
-       (&key name id last_activity execution_state
-             connections &allow-other-keys)
-       kernel
-     (let* ((time (jupyter-decode-time last_activity))
-            (name (propertize
-                   (or (jupyter-server-kernel-name jupyter-current-server id)
-                       (let ((same (cl-remove-if-not
-                                    (lambda (x) (string-prefix-p name x)) names)))
-                         (when same (setq name (format "%s<%d>" name (length same))))
-                         (push name names)
-                         name))
-                   'face 'font-lock-constant-face))
-            (activity (propertize (jupyter-format-time-low-res time)
-                                  'face 'font-lock-doc-face
-                                  'jupyter-time time))
-            (conns (propertize (number-to-string connections)
-                               'face 'shadow))
-            (state (propertize execution_state
-                               'face (pcase execution_state
-                                       ("busy" 'warning)
-                                       ("idle" 'shadow)
-                                       ("starting" 'success)))))
-       (list id (vector name id activity state conns))))))
-
-;;;###autoload
-(defun jupyter-server-list-kernels (server)
-  "Display a list of live kernels on SERVER.
-When called interactively, ask to select a SERVER when given a
-prefix argument otherwise the `jupyter-current-server' will be
-used."
-  (interactive (list (jupyter-current-server current-prefix-arg)))
-  (if (zerop (length (jupyter-api-get-kernel server)))
-      (when (yes-or-no-p (format "No kernels at %s; launch one? "
-                                 (oref server url)))
-        (jupyter-server-launch-kernel server)
-        (jupyter-server-list-kernels server))
-    (with-current-buffer
-        (jupyter-get-buffer-create (format "kernels[%s]" (oref server url)))
-      (setq jupyter-current-server server)
-      (if (eq major-mode 'jupyter-server-kernel-list-mode)
-          (revert-buffer)
-        (setq tabulated-list-format (jupyter-server--kernel-list-format)
-              tabulated-list-entries #'jupyter-server--kernel-list-entries
-              tabulated-list-sort-key (cons "Activity" t))
-        (jupyter-server-kernel-list-mode)
-        ;; So that `dired-jump' will visit the directory of the kernel server.
-        (setq default-directory
-              (jupyter-tramp-file-name-from-url (oref server url))))
-      (jupyter-display-current-buffer-reuse-window))))
-
-(provide 'jupyter-server)
+    (let ((name (cond (repl-name)
+                    ((jupyter-server-kernel-name server kernel-id))
+                    (t (jupyter-server-kernel-notebook server kernel-id)))))
+      (jupyter-bootstrap-repl client name associate-buffer display))))
 
 ;;; jupyter-server.el ends here

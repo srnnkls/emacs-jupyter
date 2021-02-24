@@ -768,6 +768,11 @@ PLIST is a property list that will be encoded into JSON with the
 requested changes."
   (apply #'jupyter-api/config client "PATCH" section plist))
 
+;;; Sessions
+(defun jupyter-api-get-sessions (client)
+  "Send an HTTP request using CLIENT to return the current session."
+  (jupyter-api-request client "GET" "api" "sessions"))
+
 ;;; Kernels API
 
 (defun jupyter-api-get-kernel (client &optional id)
