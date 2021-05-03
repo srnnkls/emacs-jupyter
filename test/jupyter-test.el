@@ -100,7 +100,7 @@
     (let ((req (jupyter-send-execute-request client :code "foo")))
       (ert-info ("Blocking callbacks")
         (jupyter-wait-until-idle req)
-        (should (jupyter-request-idle-received-p req)))
+        (should (jupyter-request-idle-p req)))
       (ert-info ("Error after idle message has been received")
         (should-error (jupyter-add-callback req :status #'identity))))))
 
@@ -828,7 +828,7 @@
            (req (jupyter-send-kernel-info-request client)))
       (should (equal (jupyter-request-inhibited-handlers req)
                      '(:stream)))
-      (should-not (jupyter--run-handler-p
+      (should-not (jupyter--request-allows-handler-p
                    req (jupyter-test-message
                         req :stream (list :name "stdout" :text "foo"))))
       (setq jupyter-inhibit-handlers '(:foo))
@@ -929,12 +929,30 @@
       (should (memq r2 mapped))
 
       (setq mapped nil)
-      (setf (jupyter-request-idle-received-p r2) t)
+      (setf (jupyter-request-idle-p r2) t)
       (jupyter-map-pending-requests client
         (lambda (req) (push req mapped)))
       (should (= (length mapped) 1))
       (should (memq r1 mapped))
       (should-not (memq r2 mapped)))))
+
+(defvar jupyter-test-idle-sync-hook nil)
+
+(ert-deftest jupyter-idle-sync ()
+  :tags '(client hook)
+  (jupyter-test-with-python-client client
+    (let ((req (jupyter-send-execute-request client :code "1 + 1")))
+      (should-not (jupyter-request-idle-p req))
+      (jupyter-idle-sync req)
+      (should (jupyter-request-idle-p req)))
+    (let ((req (jupyter-send-execute-request client :code "1 + 1")))
+      (should (null jupyter-test-idle-sync-hook))
+      (jupyter-add-idle-sync-hook 'jupyter-test-idle-sync-hook req)
+      (should-not (null jupyter-test-idle-sync-hook))
+      (should-not (jupyter-request-idle-p req))
+      (run-hooks 'jupyter-test-idle-sync-hook)
+      (should (jupyter-request-idle-p req))
+      (should (null jupyter-test-idle-sync-hook)))))
 
 ;;; IOloop
 
@@ -943,7 +961,7 @@
   (let ((ioloop (jupyter-ioloop))
         (jupyter-default-timeout 2))
     (should-not (process-live-p (oref ioloop process)))
-    (jupyter-ioloop-start ioloop :tag1)
+    (jupyter-ioloop-start ioloop #'ignore)
     (should (equal (jupyter-ioloop-last-event ioloop) '(start)))
     (with-slots (process) ioloop
       (should (process-live-p process))
@@ -955,17 +973,17 @@
 (defvar jupyter-ioloop-test-handler-called nil
   "Flag variable used for testing the `juyter-ioloop'.")
 
-(cl-defmethod jupyter-ioloop-handler ((_ioloop jupyter-ioloop)
-                                      (_tag (eql :test))
-                                      (event (head test)))
-  (should (equal (cadr event) "message"))
-  (setq jupyter-ioloop-test-handler-called t))
+(defun jupyter-test-ioloop-start (ioloop)
+  (jupyter-ioloop-start
+   ioloop (lambda (event)
+            (should (equal (cadr event) "message"))
+            (setq jupyter-ioloop-test-handler-called t))))
 
 (ert-deftest jupyter-ioloop-wait-until ()
   :tags '(ioloop)
   (let ((ioloop (jupyter-ioloop)))
     (should-not (jupyter-ioloop-last-event ioloop))
-    (jupyter-ioloop-start ioloop :test)
+    (jupyter-test-ioloop-start ioloop)
     (should (equal (jupyter-ioloop-last-event ioloop) '(start)))
     (jupyter-ioloop-stop ioloop)))
 
@@ -976,13 +994,13 @@
       (setq jupyter-ioloop-test-handler-called nil)
       (jupyter-ioloop-add-callback ioloop
         `(lambda () (zmq-prin1 (list 'test "message"))))
-      (jupyter-ioloop-start ioloop :test)
+      (jupyter-test-ioloop-start ioloop)
       (jupyter-ioloop-stop ioloop)
       (should jupyter-ioloop-test-handler-called)))
   (ert-info ("Callback added after starting the ioloop")
     (let ((ioloop (jupyter-ioloop)))
       (setq jupyter-ioloop-test-handler-called nil)
-      (jupyter-ioloop-start ioloop :test)
+      (jupyter-test-ioloop-start ioloop)
       (should (process-live-p (oref ioloop process)))
       (jupyter-ioloop-add-callback ioloop
         `(lambda () (zmq-prin1 (list 'test "message"))))
@@ -996,7 +1014,7 @@
     (setq jupyter-ioloop-test-handler-called nil)
     (jupyter-ioloop-add-setup ioloop
       (zmq-prin1 (list 'test "message")))
-    (jupyter-ioloop-start ioloop :test)
+    (jupyter-test-ioloop-start ioloop)
     (jupyter-ioloop-stop ioloop)
     (should jupyter-ioloop-test-handler-called)))
 
@@ -1006,7 +1024,7 @@
     (setq jupyter-ioloop-test-handler-called nil)
     (jupyter-ioloop-add-teardown ioloop
       (zmq-prin1 (list 'test "message")))
-    (jupyter-ioloop-start ioloop :test)
+    (jupyter-test-ioloop-start ioloop)
     (jupyter-ioloop-stop ioloop)
     (should jupyter-ioloop-test-handler-called)))
 
@@ -1017,7 +1035,7 @@
     (jupyter-ioloop-add-event ioloop test (data)
       "Echo DATA back to the parent process."
       (list 'test data))
-    (jupyter-ioloop-start ioloop :test)
+    (jupyter-test-ioloop-start ioloop)
     (jupyter-send ioloop 'test "message")
     (jupyter-ioloop-stop ioloop)
     (should jupyter-ioloop-test-handler-called)))
@@ -1910,14 +1928,7 @@ next(x"))))))
       (should (org-babel-jupyter-remote-session-p session))
       (should (org-babel-jupyter-remote-session-connect-repl-p session))
       (should (equal (org-babel-jupyter-session-name session) "/ssh:ec2:foo/bar.json"))))
-  (ert-info ("Server sessions")
-    (let ((session (org-babel-jupyter-parse-session "/jpy::foo/bar.json")))
-      (should (org-babel-jupyter-server-session-p session))
-      (should (equal (org-babel-jupyter-session-name session) "/jpy::foo/bar.json")))
-    (let ((session (org-babel-jupyter-parse-session "/jpy::foo/bar")))
-      (should (org-babel-jupyter-server-session-p session))
-      (should (equal (org-babel-jupyter-session-name session) "/jpy::foo/bar"))))
-  (ert-info ("Other remote sessions")
+  (ert-info ("Remote sessions")
     (let ((session (org-babel-jupyter-parse-session "/ssh:ec2:foo/bar")))
       (should (org-babel-jupyter-remote-session-p session))
       (should-not (org-babel-jupyter-remote-session-connect-repl-p session))
